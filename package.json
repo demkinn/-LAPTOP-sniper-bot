@@ -1,0 +1,14 @@
+{
+  "name": "laptop-sniper-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/src/sniper.js",
+    "dev": "node --enable-source-maps --loader ts-node/esm src/sniper.ts"
+  },
+  "dependencies": { "dotenv": "^17.2.1" },
+  "devDependencies": { "@types/node": "^24.0.0", "typescript": "^5.9.2" }
+}
