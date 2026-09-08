@@ -1,105 +1,180 @@
 import 'dotenv/config';
+import { existsSync } from 'node:fs';
+import { getAddress, parseEther } from 'viem';
+import { assertConfig, config } from './config.js';
+import { fetchPairs, pairPrice, qualifies, type Pair } from './market.js';
+import { event, loadState, saveState, type BotState } from './state.js';
+import { getAccountAddress, publicClient, executeNativeBuy, executeTokenSell } from './execution.js';
+import { NATIVE_ETH, quote } from './zerox.js';
 
-const TOKEN = (process.env.LAPTOP_TOKEN || '0xB095274743941e953c746F9C228DA9c18Bb6ec29').toLowerCase();
-const POLL_MS = Math.max(750, Number(process.env.SNIPER_POLL_MS || 1500));
-const ENTRY_USD = Math.max(1, Number(process.env.PAPER_ENTRY_USD || 100));
-const MIN_LIQUIDITY_USD = Math.max(0, Number(process.env.MIN_LIQUIDITY_USD || 25_000));
-const MAX_LIQUIDITY_USD = Math.max(MIN_LIQUIDITY_USD, Number(process.env.MAX_LIQUIDITY_USD || 500_000));
-const MIN_M5_VOLUME_USD = Math.max(0, Number(process.env.MIN_M5_VOLUME_USD || 250));
-const TAKE_PROFIT_PCT = Number(process.env.TAKE_PROFIT_PCT || 0.50);
-const STOP_LOSS_PCT = Number(process.env.STOP_LOSS_PCT || 0.20);
-const PAPER_MODE = (process.env.PAPER_MODE ?? 'true').toLowerCase() !== 'false';
+assertConfig();
 
-if (!PAPER_MODE) throw new Error('Live execution is disabled in this standalone V1. Set PAPER_MODE=true.');
+const state = await loadState(config.stateFile);
+const seenPairs = new Set<string>();
+let running = true;
 
-interface Pair {
-  chainId?: string;
-  dexId?: string;
-  url?: string;
-  pairAddress?: string;
-  baseToken?: { address?: string; symbol?: string };
-  quoteToken?: { address?: string; symbol?: string };
-  priceUsd?: string;
-  liquidity?: { usd?: number };
-  volume?: { m5?: number };
-  txns?: { m5?: { buys?: number; sells?: number } };
-  pairCreatedAt?: number;
+function live(): boolean {
+  return !config.paperMode;
 }
 
-interface DexResponse { pairs?: Pair[] | null }
-interface Position { pairAddress: string; entryPrice: number; entryAt: number; lastPrice: number; url: string }
-
-let position: Position | null = null;
-let seenPair = '';
-
-async function getPairs(): Promise<Pair[]> {
-  const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${TOKEN}`, { headers: { accept: 'application/json' } });
-  if (!res.ok) throw new Error(`DexScreener HTTP ${res.status}`);
-  const body = (await res.json()) as DexResponse;
-  return (body.pairs ?? [])
-    .filter((p) => p.chainId === 'base')
-    .filter((p) => p.baseToken?.address?.toLowerCase() === TOKEN)
-    .filter((p) => !!p.pairAddress && !!p.priceUsd);
+function riskAllowed(): boolean {
+  return state.realizedPnlEth > -config.dailyLossEth;
 }
 
-function qualifies(pair: Pair): { ok: boolean; reason: string } {
-  const liquidity = Number(pair.liquidity?.usd || 0);
-  const m5Volume = Number(pair.volume?.m5 || 0);
-  const buys = Number(pair.txns?.m5?.buys || 0);
-  const sells = Number(pair.txns?.m5?.sells || 0);
-  if (liquidity < MIN_LIQUIDITY_USD) return { ok: false, reason: `liquidity ${liquidity.toFixed(0)} < ${MIN_LIQUIDITY_USD}` };
-  if (liquidity > MAX_LIQUIDITY_USD) return { ok: false, reason: `liquidity ${liquidity.toFixed(0)} > ${MAX_LIQUIDITY_USD}` };
-  if (m5Volume < MIN_M5_VOLUME_USD) return { ok: false, reason: `m5 volume ${m5Volume.toFixed(0)} < ${MIN_M5_VOLUME_USD}` };
-  if (buys < 1) return { ok: false, reason: 'no buys in 5m' };
-  if (buys < sells) return { ok: false, reason: `sell pressure ${buys}/${sells}` };
-  return { ok: true, reason: 'all entry gates passed' };
+function halted(): boolean {
+  return existsSync(process.env.EMERGENCY_STOP_FILE || 'STOP');
 }
 
-function log(pair: Pair): void {
-  const liquidity = Number(pair.liquidity?.usd || 0);
-  const volume = Number(pair.volume?.m5 || 0);
-  const buys = Number(pair.txns?.m5?.buys || 0);
-  const sells = Number(pair.txns?.m5?.sells || 0);
-  const price = Number(pair.priceUsd || 0);
-  console.log(`[${new Date().toISOString()}] ${pair.dexId ?? 'dex'} price=$${price.toPrecision(8)} liq=$${liquidity.toFixed(0)} m5=$${volume.toFixed(0)} buys/sells=${buys}/${sells}`);
+function log(message: string): void {
+  console.log(`[${new Date().toISOString()}] ${message}`);
 }
 
-function enter(pair: Pair): void {
-  const price = Number(pair.priceUsd || 0);
-  if (!pair.pairAddress || !price) return;
-  position = { pairAddress: pair.pairAddress, entryPrice: price, entryAt: Date.now(), lastPrice: price, url: pair.url || '' };
-  console.log(`🚀 PAPER SNIPE: $${ENTRY_USD.toFixed(2)} @ $${price.toPrecision(10)} | ${pair.url || pair.pairAddress}`);
+async function emit(type: string, data: Record<string, unknown>): Promise<void> {
+  await event(config.logFile, type, data);
 }
 
-function manage(pair: Pair): void {
-  if (!position || position.pairAddress !== pair.pairAddress) return;
-  const price = Number(pair.priceUsd || 0);
-  if (!price) return;
-  position.lastPrice = price;
-  const pnl = price / position.entryPrice - 1;
-  if (pnl >= TAKE_PROFIT_PCT || pnl <= -STOP_LOSS_PCT) {
-    console.log(`🏁 PAPER EXIT ${pnl >= 0 ? 'TP' : 'SL'} ${(pnl * 100).toFixed(2)}% | $${position.entryPrice.toPrecision(10)} → $${price.toPrecision(10)}`);
-    position = null;
+function candidate(pairs: Pair[]): Pair | null {
+  const eligible = pairs.filter((p) => qualifies(p).ok);
+  eligible.sort((a, b) => {
+    const ageA = a.pairCreatedAt ?? Number.MAX_SAFE_INTEGER;
+    const ageB = b.pairCreatedAt ?? Number.MAX_SAFE_INTEGER;
+    if (ageA !== ageB) return ageA - ageB;
+    return Number(b.liquidity?.usd || 0) - Number(a.liquidity?.usd || 0);
+  });
+  return eligible[0] ?? null;
+}
+
+async function openPosition(pair: Pair): Promise<void> {
+  if (!pair.pairAddress || !pair.priceUsd) return;
+  const price = pairPrice(pair);
+  if (!price || seenPairs.has(pair.pairAddress)) return;
+  seenPairs.add(pair.pairAddress);
+
+  if (!live()) {
+    state.position = {
+      pairAddress: pair.pairAddress,
+      entryPriceUsd: price,
+      entryAmountToken: 'PAPER',
+      entryEth: config.tradeEth,
+      entryAt: Date.now(),
+      peakPriceUsd: price
+    };
+    await saveState(config.stateFile, state);
+    await emit('paper_buy', { pair: pair.pairAddress, dex: pair.dexId, priceUsd: price, eth: config.tradeEth });
+    log(`PAPER BUY $${config.tradeEth} at $${price} on ${pair.dexId ?? 'dex'}`);
+    return;
   }
+
+  await assertNativeBalance(config.tradeEth);
+  const taker = getAccountAddress();
+  const q = await quote(NATIVE_ETH, config.token, parseEther(config.tradeEth.toString()), taker);
+  const txHash = await executeNativeBuy(q);
+  await publicClient.waitForTransactionReceipt({ hash: txHash });
+
+  state.position = {
+    pairAddress: pair.pairAddress,
+    entryPriceUsd: price,
+    entryAmountToken: q.buyAmount,
+    entryEth: config.tradeEth,
+    entryAt: Date.now(),
+    peakPriceUsd: price,
+    txHash
+  };
+  await saveState(config.stateFile, state);
+  await emit('live_buy', { pair: pair.pairAddress, dex: pair.dexId, priceUsd: price, eth: config.tradeEth, txHash });
+  log(`LIVE BUY $${config.tradeEth} tx=${txHash}`);
+}
+
+async function closePosition(priceUsd: number, reason: string): Promise<void> {
+  const pos = state.position;
+  if (!pos) return;
+  const pnlPct = priceUsd / pos.entryPriceUsd - 1;
+  const pnlEth = pos.entryEth * pnlPct;
+
+  if (!live()) {
+    state.realizedPnlEth += pnlEth;
+    state.lastTradeAt = Date.now();
+    state.position = null;
+    await saveState(config.stateFile, state);
+    await emit('paper_sell', { reason, priceUsd, pnlPct, pnlEth });
+    log(`PAPER SELL ${reason} ${(pnlPct * 100).toFixed(2)}%`);
+    return;
+  }
+
+  const taker = getAccountAddress();
+  const balance = await publicClient.readContract({ address: config.token, abi: [{ type: 'function', name: 'balanceOf', stateMutability: 'view', inputs: [{ name: 'owner', type: 'address' }], outputs: [{ type: 'uint256' }] }], functionName: 'balanceOf', args: [taker] }) as bigint;
+  if (balance === 0n) throw new Error('No $LAPTOP token balance available to sell.');
+  const q = await quote(config.token, NATIVE_ETH, balance, taker);
+  const txHash = await executeTokenSell(q);
+  await publicClient.waitForTransactionReceipt({ hash: txHash });
+  state.realizedPnlEth += pnlEth;
+  state.lastTradeAt = Date.now();
+  state.position = null;
+  await saveState(config.stateFile, state);
+  await emit('live_sell', { reason, priceUsd, pnlPct, pnlEth, txHash });
+  log(`LIVE SELL ${reason} ${(pnlPct * 100).toFixed(2)}% tx=${txHash}`);
+}
+
+async function manage(pair: Pair): Promise<void> {
+  const pos = state.position;
+  if (!pos || pair.pairAddress !== pos.pairAddress) return;
+  const price = pairPrice(pair);
+  if (!price) return;
+  pos.peakPriceUsd = Math.max(pos.peakPriceUsd, price);
+  const pnlPct = price / pos.entryPriceUsd - 1;
+  const drawdownFromPeak = 1 - price / pos.peakPriceUsd;
+  const ageMin = (Date.now() - pos.entryAt) / 60_000;
+
+  if (pnlPct >= config.takeProfitPct) return closePosition(price, 'TP');
+  if (pnlPct <= -config.stopLossPct) return closePosition(price, 'SL');
+  if (pnlPct >= config.trailActivatePct && drawdownFromPeak >= config.trailPullbackPct) return closePosition(price, 'TRAIL');
+  if (ageMin >= config.maxHoldMin) return closePosition(price, 'TIME');
+
+  await saveState(config.stateFile, state);
 }
 
 async function tick(): Promise<void> {
-  const pairs = await getPairs();
-  if (!pairs.length) {
-    console.log(`[${new Date().toISOString()}] no Base $LAPTOP pair found`);
+  if (halted()) {
+    log('EMERGENCY STOP active; refusing all new orders.');
     return;
   }
-  pairs.sort((a, b) => Number(b.liquidity?.usd || 0) - Number(a.liquidity?.usd || 0));
-  const pair = pairs[0]!;
-  log(pair);
-  manage(pair);
-  if (position || pair.pairAddress === seenPair) return;
-  const gate = qualifies(pair);
-  console.log(`  → ${gate.ok ? 'QUALIFIED' : 'REJECTED'}: ${gate.reason}`);
-  if (gate.ok) enter(pair);
-  seenPair = pair.pairAddress || '';
+  if (!riskAllowed()) {
+    log(`DAILY LOSS LIMIT reached (${state.realizedPnlEth.toFixed(6)} ETH).`);
+    return;
+  }
+  if (state.position && Date.now() - state.lastTradeAt < config.cooldownSec * 1000) return;
+
+  const pairs = await fetchPairs();
+  for (const p of pairs) {
+    const ok = qualifies(p);
+    if (!ok.ok) continue;
+    await manage(p);
+  }
+  if (state.position) return;
+
+  const next = candidate(pairs);
+  if (!next) {
+    log('No qualifying Base $LAPTOP pair.');
+    return;
+  }
+  await openPosition(next);
 }
 
-console.log(`Standalone $LAPTOP Sniper V1 — PAPER MODE ONLY\nToken=${TOKEN}\nPoll=${POLL_MS}ms Entry=$${ENTRY_USD} TP=${TAKE_PROFIT_PCT * 100}% SL=${STOP_LOSS_PCT * 100}%`);
-await tick();
-setInterval(() => void tick().catch((e: unknown) => console.error('[tick error]', e)), POLL_MS);
+process.once('SIGINT', () => { running = false; });
+process.once('SIGTERM', () => { running = false; });
+
+log(`$LAPTOP Sniper 2.0 | Base 8453 | ${live() ? 'LIVE' : 'PAPER'} | token=${getAddress(config.token)}`);
+log(`Trade=${config.tradeEth} ETH, max age=${config.maxPairAgeSec}s, slip=${config.maxSlippageBps}bps, TP=${config.takeProfitPct * 100}%, SL=${config.stopLossPct * 100}%`);
+
+while (running) {
+  try {
+    await tick();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await emit('error', { message });
+    log(`ERROR ${message}`);
+  }
+  await new Promise((resolve) => setTimeout(resolve, config.pollMs));
+}
+
+await saveState(config.stateFile, state);
