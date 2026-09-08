@@ -4,7 +4,7 @@ import { getAddress, parseEther } from 'viem';
 import { assertConfig, config } from './config.js';
 import { fetchPairs, pairPrice, qualifies, type Pair } from './market.js';
 import { event, loadState, saveState, type BotState } from './state.js';
-import { getAccountAddress, publicClient, executeNativeBuy, executeTokenSell } from './execution.js';
+import { assertNativeBalance, getAccountAddress, publicClient, executeNativeBuy, executeTokenSell } from './execution.js';
 import { NATIVE_ETH, quote } from './zerox.js';
 
 assertConfig();
@@ -13,25 +13,11 @@ const state = await loadState(config.stateFile);
 const seenPairs = new Set<string>();
 let running = true;
 
-function live(): boolean {
-  return !config.paperMode;
-}
-
-function riskAllowed(): boolean {
-  return state.realizedPnlEth > -config.dailyLossEth;
-}
-
-function halted(): boolean {
-  return existsSync(process.env.EMERGENCY_STOP_FILE || 'STOP');
-}
-
-function log(message: string): void {
-  console.log(`[${new Date().toISOString()}] ${message}`);
-}
-
-async function emit(type: string, data: Record<string, unknown>): Promise<void> {
-  await event(config.logFile, type, data);
-}
+function live(): boolean { return !config.paperMode; }
+function riskAllowed(): boolean { return state.realizedPnlEth > -config.dailyLossEth; }
+function halted(): boolean { return existsSync(process.env.EMERGENCY_STOP_FILE || 'STOP'); }
+function log(message: string): void { console.log(`[${new Date().toISOString()}] ${message}`); }
+async function emit(type: string, data: Record<string, unknown>): Promise<void> { await event(config.logFile, type, data); }
 
 function candidate(pairs: Pair[]): Pair | null {
   const eligible = pairs.filter((p) => qualifies(p).ok);
@@ -45,20 +31,13 @@ function candidate(pairs: Pair[]): Pair | null {
 }
 
 async function openPosition(pair: Pair): Promise<void> {
-  if (!pair.pairAddress || !pair.priceUsd) return;
+  if (!pair.pairAddress || !pair.priceUsd || seenPairs.has(pair.pairAddress)) return;
   const price = pairPrice(pair);
-  if (!price || seenPairs.has(pair.pairAddress)) return;
+  if (!price) return;
   seenPairs.add(pair.pairAddress);
 
   if (!live()) {
-    state.position = {
-      pairAddress: pair.pairAddress,
-      entryPriceUsd: price,
-      entryAmountToken: 'PAPER',
-      entryEth: config.tradeEth,
-      entryAt: Date.now(),
-      peakPriceUsd: price
-    };
+    state.position = { pairAddress: pair.pairAddress, entryPriceUsd: price, entryAmountToken: 'PAPER', entryEth: config.tradeEth, entryAt: Date.now(), peakPriceUsd: price };
     await saveState(config.stateFile, state);
     await emit('paper_buy', { pair: pair.pairAddress, dex: pair.dexId, priceUsd: price, eth: config.tradeEth });
     log(`PAPER BUY $${config.tradeEth} at $${price} on ${pair.dexId ?? 'dex'}`);
@@ -70,16 +49,7 @@ async function openPosition(pair: Pair): Promise<void> {
   const q = await quote(NATIVE_ETH, config.token, parseEther(config.tradeEth.toString()), taker);
   const txHash = await executeNativeBuy(q);
   await publicClient.waitForTransactionReceipt({ hash: txHash });
-
-  state.position = {
-    pairAddress: pair.pairAddress,
-    entryPriceUsd: price,
-    entryAmountToken: q.buyAmount,
-    entryEth: config.tradeEth,
-    entryAt: Date.now(),
-    peakPriceUsd: price,
-    txHash
-  };
+  state.position = { pairAddress: pair.pairAddress, entryPriceUsd: price, entryAmountToken: q.buyAmount, entryEth: config.tradeEth, entryAt: Date.now(), peakPriceUsd: price, txHash };
   await saveState(config.stateFile, state);
   await emit('live_buy', { pair: pair.pairAddress, dex: pair.dexId, priceUsd: price, eth: config.tradeEth, txHash });
   log(`LIVE BUY $${config.tradeEth} tx=${txHash}`);
@@ -90,7 +60,6 @@ async function closePosition(priceUsd: number, reason: string): Promise<void> {
   if (!pos) return;
   const pnlPct = priceUsd / pos.entryPriceUsd - 1;
   const pnlEth = pos.entryEth * pnlPct;
-
   if (!live()) {
     state.realizedPnlEth += pnlEth;
     state.lastTradeAt = Date.now();
@@ -100,7 +69,6 @@ async function closePosition(priceUsd: number, reason: string): Promise<void> {
     log(`PAPER SELL ${reason} ${(pnlPct * 100).toFixed(2)}%`);
     return;
   }
-
   const taker = getAccountAddress();
   const balance = await publicClient.readContract({ address: config.token, abi: [{ type: 'function', name: 'balanceOf', stateMutability: 'view', inputs: [{ name: 'owner', type: 'address' }], outputs: [{ type: 'uint256' }] }], functionName: 'balanceOf', args: [taker] }) as bigint;
   if (balance === 0n) throw new Error('No $LAPTOP token balance available to sell.');
@@ -124,39 +92,22 @@ async function manage(pair: Pair): Promise<void> {
   const pnlPct = price / pos.entryPriceUsd - 1;
   const drawdownFromPeak = 1 - price / pos.peakPriceUsd;
   const ageMin = (Date.now() - pos.entryAt) / 60_000;
-
   if (pnlPct >= config.takeProfitPct) return closePosition(price, 'TP');
   if (pnlPct <= -config.stopLossPct) return closePosition(price, 'SL');
   if (pnlPct >= config.trailActivatePct && drawdownFromPeak >= config.trailPullbackPct) return closePosition(price, 'TRAIL');
   if (ageMin >= config.maxHoldMin) return closePosition(price, 'TIME');
-
   await saveState(config.stateFile, state);
 }
 
 async function tick(): Promise<void> {
-  if (halted()) {
-    log('EMERGENCY STOP active; refusing all new orders.');
-    return;
-  }
-  if (!riskAllowed()) {
-    log(`DAILY LOSS LIMIT reached (${state.realizedPnlEth.toFixed(6)} ETH).`);
-    return;
-  }
+  if (halted()) { log('EMERGENCY STOP active; refusing all new orders.'); return; }
+  if (!riskAllowed()) { log(`DAILY LOSS LIMIT reached (${state.realizedPnlEth.toFixed(6)} ETH).`); return; }
   if (state.position && Date.now() - state.lastTradeAt < config.cooldownSec * 1000) return;
-
   const pairs = await fetchPairs();
-  for (const p of pairs) {
-    const ok = qualifies(p);
-    if (!ok.ok) continue;
-    await manage(p);
-  }
+  for (const p of pairs) await manage(p);
   if (state.position) return;
-
   const next = candidate(pairs);
-  if (!next) {
-    log('No qualifying Base $LAPTOP pair.');
-    return;
-  }
+  if (!next) { log('No qualifying Base $LAPTOP pair.'); return; }
   await openPosition(next);
 }
 
